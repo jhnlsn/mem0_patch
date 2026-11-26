@@ -1,93 +1,81 @@
 # Patching instructions
 
-You are patching an installed OpenClaw Mem0 plugin. Follow the steps in order.
+You are updating an installed OpenClaw Mem0 plugin to current versions and patching it. Follow the steps in order, in one Bash shell.
 
 ## Rules
 
-1. Work on a copy. Change the live plugin only in step 6, after the user approves.
+1. Build in a new directory. Change the live setup only in steps 7 and 8, after the user approves.
 2. Apply a patch only when its "before" block matches **exactly once**. If neither the "before" nor the "after" block matches, stop, show the user the current code, and propose an adaptation. Do not force it.
-3. Every step must be safe to repeat. Skip patches that are already applied.
+3. Skip patches that are already applied.
 4. Never print or commit secrets. `openclaw.json` contains credentials.
-5. Do not run `npm install` or `pnpm install` in the plugin directory. It rewrites much more than these patches need, and with `--ignore-scripts` it can remove native modules.
-6. Do not delete, recreate, or migrate Qdrant collections.
+5. Do not run `npm install` or `pnpm install` in the live plugin directory.
+6. Do not delete, recreate, or migrate live Qdrant collections.
 7. Report what you tested and what you did not.
 
-## Tested combination
-
-Tested on 2026-11-26:
-
-| Component | Version |
-|---|---|
-| `@mem0/openclaw-mem0` | 1.0.14 |
-| `mem0ai` | 3.0.7 |
-| `@qdrant/js-client-rest` | 1.20.0 |
-| `undici` | 7.29.1 |
-| Qdrant server | 1.20.0 |
-| Node.js | 26.13.1 |
-
-Covered: both patches applied to a copy, a syntax check of the patched `dist/index.js`, and `scripts/verify-qdrant.mjs` (ESM and CommonJS adapters).
-
-Not covered: loading the patched copy in a running Gateway, end-to-end recall and capture, and the timer's runtime behavior.
+See [SUPPORT.md](SUPPORT.md) for tested combinations. Tell the user before using any other.
 
 ## 1. Inspect
 
 ```bash
 REPO="$(pwd)"   # root of this repository
-LIVE="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/extensions/openclaw-mem0"
-cd "$LIVE"
-for p in . node_modules/mem0ai node_modules/@qdrant/js-client-rest node_modules/undici; do
-  node -p "const j=require('./$p/package.json'); j.name+' '+j.version"
+STATE="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+LIVE="$STATE/extensions/openclaw-mem0"
+for p in . node_modules/mem0ai node_modules/@qdrant/js-client-rest; do
+  node -p "const j=require('$LIVE/$p/package.json'); j.name+' '+j.version"
 done
-grep -c 'client.search(this.collectionName' node_modules/mem0ai/dist/oss/index.{mjs,js}
-grep -c 'clearTimeout(recallTimer)' dist/index.js
-npm view @mem0/openclaw-mem0 version
-npm view mem0ai version
-npm view @qdrant/js-client-rest version
+grep -c 'client.search(this.collectionName' "$LIVE"/node_modules/mem0ai/dist/oss/index.{mjs,js} || true
+grep -c 'clearTimeout(recallTimer)' "$LIVE/dist/index.js" || true
+jq -r '.plugins.entries["openclaw-mem0"].config.oss | "embedder=\(.embedder.provider) llm=\(.llm.provider) store=\(.vectorStore.provider)"' "$STATE/openclaw.json"
+for p in @mem0/openclaw-mem0 mem0ai @qdrant/js-client-rest; do echo "$p $(npm view $p version)"; done
 ```
 
-If the plugin is installed elsewhere, ask the user for the path.
+If the plugin is installed elsewhere, ask the user for the path. These steps cover open-source mode with a Qdrant store.
 
-- Check [mem0ai/mem0#7495](https://github.com/mem0ai/mem0/issues/7495). If a fix is released **and** the installed `mem0ai` contains it, skip the Query API patch.
-- A `search` count of `0` does not alone prove the patch is applied. Compare with the "after" block.
-- If versions differ from the tested table, tell the user before continuing.
+Check [mem0ai/mem0#7495](https://github.com/mem0ai/mem0/issues/7495). If a fix is released and in the `mem0ai` version you will install, skip the query patch.
 
-## 2. Make a working copy
+## 2. Download the plugin
 
 ```bash
-WORK="$(mktemp -d)"
-cp -a "$LIVE" "$WORK/plugin"
-```
-
-## 3. Update the Qdrant client
-
-Replace only the client package. Use the version the user wants; `1.20.0` is the tested one.
-
-```bash
-VER=1.20.0
+PLUGIN_VER=1.2.1
+MEM0_VER=3.3.1
+CLIENT_VER=1.20.0
+WORK="$(mktemp -d "$HOME/mem0-build.XXXXXX")"
 cd "$WORK"
-npm pack "@qdrant/js-client-rest@$VER" --ignore-scripts
-mkdir client && tar -xzf "qdrant-js-client-rest-$VER.tgz" -C client
-node -p "require('./client/package/package.json').dependencies"
-rm -rf plugin/node_modules/@qdrant/js-client-rest
-cp -a client/package plugin/node_modules/@qdrant/js-client-rest
+npm pack "@mem0/openclaw-mem0@$PLUGIN_VER" --ignore-scripts --silent
+tar -xzf ./*.tgz && mv package candidate
 ```
 
-Check that every listed dependency resolves from the new client at a satisfying version:
+## 3. Set dependency versions
 
 ```bash
-cd "$WORK/plugin/node_modules/@qdrant/js-client-rest"
-node -e "const r=require('module').createRequire(process.cwd()+'/package.json');
-for (const [d,want] of Object.entries(require('./package.json').dependencies)) {
-  const p=r.resolve.paths(d).map(x=>x+'/'+d+'/package.json').find(require('fs').existsSync);
-  console.log(d,'wants',want,'found',p?require(p).version:'MISSING');
-}"
+cd "$WORK/candidate"
+jq --arg m "$MEM0_VER" --arg c "$CLIENT_VER" '
+  .dependencies.mem0ai=$m | .dependencies["@qdrant/js-client-rest"]=$c
+  | .overrides={"mem0ai":$m,"@qdrant/js-client-rest":$c}
+  | del(.devDependencies,.pnpm)' package.json > package.json.new && mv package.json.new package.json
 ```
 
-If a dependency is missing or does not satisfy the range, stop and report it.
+`mem0ai` loads some provider libraries only when used, and does not install them for you. For the Ollama embedder:
 
-Then set every `@qdrant/js-client-rest` version entry in `$WORK/plugin/package.json` and `$WORK/plugin/pnpm-workspace.yaml` to the exact version installed.
+```bash
+RANGE="$(jq -r .peerDependencies.ollama <(npm view "mem0ai@$MEM0_VER" --json))"
+OLLAMA_VER="$(npm view "ollama@$RANGE" version --json | jq -r 'if type=="array" then last else . end')"
+jq --arg o "$OLLAMA_VER" '.dependencies.ollama=$o' package.json > package.json.new && mv package.json.new package.json
+```
 
-## 4. Patch: Query API
+For other providers, check `peerDependencies` of `mem0ai` and add what the configured provider needs.
+
+## 4. Install in the build directory
+
+```bash
+cd "$WORK/candidate"
+npm install --omit=dev --no-audit --no-fund
+node -e "const D=require('better-sqlite3'); new D(':memory:').close(); console.log('sqlite ok')"
+```
+
+npm may warn that `better-sqlite3` has an install script awaiting approval. The check must print `sqlite ok`; if it does not, show the user the warning and ask before approving the script.
+
+## 5. Patch: query API
 
 Apply to **both** files:
 
@@ -119,7 +107,7 @@ After:
 
 `query()` returns `{ points }` and omits payloads unless asked, so all of these changes are required. Do not touch `keywordSearch()` or the other vector stores.
 
-## 5. Patch: recall timer
+## 6. Patch: recall timer
 
 File: `dist/index.js`, which is what the plugin loads (confirm with `main` in `package.json`).
 
@@ -160,62 +148,81 @@ After:
         }
 ```
 
-The bundler may rename `resolve2`. Matching that rename is an acceptable adaptation if the logic is otherwise identical. The surrounding `try`/`catch` stays as it is.
+The bundler may rename `resolve2`. Matching that rename is acceptable if the logic is otherwise identical. The surrounding `try`/`catch` stays as it is.
 
-## 6. Verify, then install
+## 7. Verify the build
 
-### Verify the copy
+Set `SERVER_TAG` to the Qdrant server version that will be live after this run.
 
 ```bash
-node --check "$WORK/plugin/dist/index.js"
-docker run -d --rm --name mem0-canary -p 127.0.0.1:16333:6333 qdrant/qdrant:v1.20.0
-until curl -sf http://127.0.0.1:16333/readyz; do sleep 1; done
-env -u NODE_OPTIONS node "$REPO/scripts/verify-qdrant.mjs" "$WORK/plugin"
+SERVER_TAG=v1.20.2
+node --check "$WORK/candidate/dist/index.js"
+wait_q() { for i in $(seq 90); do curl -sf -m 3 "http://127.0.0.1:$1/readyz" >/dev/null && return 0; sleep 1; done; return 1; }
+docker run -d --rm --name mem0-canary -p 127.0.0.1:16333:6333 "qdrant/qdrant:$SERVER_TAG"
+wait_q 16333 && env -u NODE_OPTIONS node "$REPO/scripts/verify-qdrant.mjs" "$WORK/candidate"
 docker stop mem0-canary
 ```
 
-Use the image tag matching the live server version. Both `esm` and `cjs` must print `PASS`. If not, stop; leave the live plugin alone.
+Both `esm` and `cjs` must print `PASS`.
 
-### Install (ask the user first)
-
-This stops the Gateway briefly. Keep the backup outside the `extensions` directory.
+Then test on a **copy** of the data. Ask the user first: this briefly stops the Gateway and Qdrant, and calls their LLM and embedder.
 
 ```bash
-BACKUP="$HOME/.openclaw-backups/openclaw-mem0-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$(dirname "$BACKUP")"
+QDRANT=mem0-qdrant   # confirm with: docker ps
+STORAGE="$(docker inspect "$QDRANT" | jq -r '.[0].Mounts[]|select(.Destination=="/qdrant/storage").Source')"
+BACKUP="$HOME/.openclaw-backups/mem0-$(date +%Y%m%d-%H%M%S)"
+mkdir -p -m 700 "$BACKUP" "$BACKUP/canary-storage"
 systemctl --user stop openclaw-gateway.service
-mv "$LIVE" "$BACKUP" && cp -a "$WORK/plugin" "$LIVE"
+docker stop -t 60 "$QDRANT"
+docker run --rm -v "$STORAGE:/src:ro" -v "$BACKUP:/dst" --entrypoint sh "qdrant/qdrant:$SERVER_TAG" -c "tar -czf /dst/storage.tgz -C /src . && chown $(id -u):$(id -g) /dst/storage.tgz && chmod 600 /dst/storage.tgz"
+docker start "$QDRANT"
+systemctl --user start openclaw-gateway.service
+tar -tzf "$BACKUP/storage.tgz" >/dev/null && echo "backup readable"
+docker run --rm -v "$BACKUP:/b" --entrypoint sh "qdrant/qdrant:$SERVER_TAG" -c 'tar -xzf /b/storage.tgz -C /b/canary-storage'
+docker run -d --rm --name mem0-canary -p 127.0.0.1:16333:6333 -v "$BACKUP/canary-storage:/qdrant/storage" "qdrant/qdrant:$SERVER_TAG"
+wait_q 16333 && node "$REPO/scripts/e2e-copy.mjs" "$WORK/candidate"
+docker stop mem0-canary
+```
+
+If `openclaw.json` refers to environment variables, export them first without printing them. If any check fails, stop and leave the live setup alone.
+
+## 8. Install (ask the user first)
+
+### Qdrant server, only if it is changing
+
+Take a fresh backup as above while Qdrant is stopped. Read `docker inspect "$QDRANT"` and recreate the container with the **same** mounts, ports, restart policy, networks and custom environment, changing only the image to `qdrant/qdrant:$SERVER_TAG`. Rename the old container instead of removing it, and set its restart policy to `no`. Compare exact point counts for every collection before and after. To roll back, restore the storage backup **and** start the old container.
+
+### Plugin
+
+Keep the old copy outside the `extensions` directory.
+
+```bash
+systemctl --user stop openclaw-gateway.service
+mv "$LIVE" "$BACKUP/plugin-old" && cp -a "$WORK/candidate" "$LIVE" \
+  || { rm -rf "$LIVE"; mv "$BACKUP/plugin-old" "$LIVE"; echo "install failed, restored"; }
 systemctl --user start openclaw-gateway.service
 ```
 
 ### Verify live
 
 ```bash
+openclaw mem0 status
 openclaw mem0 search "preferences"
 journalctl --user -u openclaw-gateway.service --since '10 min ago' | grep -i mem0
 ```
 
-- The search returns without error.
-- After a real agent turn, the log shows memory injection and capture, with no `client.search is not a function`, `recall failed`, or `capture failed`.
+- Status connects and the search returns without error.
+- After a real chat turn, the log shows memory injection and capture, with no `client.search is not a function`, `recall failed`, `capture failed`, or `package is required`.
 - A successful injection is not followed about 8 seconds later by a stray timeout warning from the same turn. Genuine timeouts can still occur.
-- With the user's approval, add a uniquely marked test memory, find it, and delete only that ID (see `openclaw mem0 add --help` and `openclaw mem0 delete --help`).
 
-### Roll back
+### Roll back the plugin
 
 ```bash
 systemctl --user stop openclaw-gateway.service
-mv "$LIVE" "$LIVE.failed" && mv "$BACKUP" "$LIVE"
-mv "$LIVE.failed" "$WORK/failed"
+mv "$LIVE" "$BACKUP/plugin-failed" && mv "$BACKUP/plugin-old" "$LIVE"
 systemctl --user start openclaw-gateway.service
 ```
 
-## Upgrading other components
-
-These are **untested**. Get approval, and back up Qdrant data (a collection snapshot or a copy of its stopped storage volume) before going live.
-
-- **Plugin or `mem0ai`:** build the new versions in the working copy, then run steps 4 to 6 against it. A plugin release may pin an older `mem0ai`; overriding it is unsupported by that release. `mem0ai` 3.3.1 still calls `client.search()` for Qdrant dense search. The verify script covers only the Qdrant adapter, not other API changes.
-- **Qdrant server:** read the release notes, test with the matching image in step 6, and pin an explicit tag instead of `latest`.
-
 ## Report
 
-Finish with: versions before and after, which patches were applied or skipped, test results, the backup path, and anything left unverified.
+Finish with: versions before and after, which patches were applied or skipped, test results, the backup path, and anything left unverified. Add the result to [SUPPORT.md](SUPPORT.md).

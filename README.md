@@ -13,4 +13,4 @@ Give a coding agent this repo and say:
 
 > Follow AGENTS.md to patch my OpenClaw Mem0 plugin.
 
-Run it again after any OpenClaw or plugin update.
+Run it again after any OpenClaw or plugin update. Tested versions are listed in [SUPPORT.md](SUPPORT.md).
